@@ -4,9 +4,10 @@ Why this exists (ADR-0002, iteration 3): claude.ai custom connectors obtain
 tokens via OAuth — discovery, dynamic client registration, PKCE, a browser
 sign-in. Rather than depend on Stack Auth's (undocumented-for-this-dance)
 OAuth posture, THIS server is its own authorization server: the login page
-checks credentials against Stack's password API and the token endpoint
-hands back Stack's own JWTs — which `server.py`'s verifier already trusts.
-claude.ai never needs to know Stack exists.
+checks credentials against Neon Auth's password API and the token endpoint
+hands back Neon Auth's own JWTs — which `server.py`'s verifier already trusts.
+claude.ai never needs to know Neon Auth exists. (Originally Stack; Neon Auth
+moved to Better Auth — ADR-0003.)
 
 Prototype-grade, honestly: in-memory stores (single instance), public
 clients + PKCE only, codes expire in 5 minutes. Session 7 professionalizes.
@@ -22,9 +23,13 @@ import urllib.request
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-ISSUER = os.environ.get("PUBLIC_URL", "https://your-protected-notes.onrender.com").rstrip("/")
-STACK_PROJECT_ID = os.environ.get("STACK_PROJECT_ID", "")
-STACK_PUB_CLIENT_KEY = os.environ.get("STACK_PUB_CLIENT_KEY", "")
+ISSUER = os.environ.get("PUBLIC_URL", "http://localhost:8000").rstrip("/")
+NEON_AUTH_URL = os.environ.get("NEON_AUTH_URL", "").rstrip("/")   # Neon console -> Settings -> Better Auth -> Auth URL
+
+# Neon Auth is now Better Auth, not Stack (ADR-0003). Its session lives in this
+# cookie; we hold the signed value as the OAuth refresh token and trade it at
+# /token for a short-lived JWT, which server.py verifies against the JWKS.
+SESSION_COOKIE = "__Secure-neon-auth.session_token"
 
 GUEST_TOKEN = "guest-no-shelf"   # a DECLARED guest credential: completes the
 # OAuth dance for users who choose the commons; server.py maps it to guest
@@ -34,17 +39,31 @@ _codes: dict = {}     # code -> {tokens, code_challenge, redirect_uri, client_id
 _clients: dict = {}   # client_id -> {redirect_uris}
 
 
-def _stack(path, payload=None, headers=None):
-    h = {"Content-Type": "application/json",
-         "X-Stack-Project-Id": STACK_PROJECT_ID,
-         "X-Stack-Publishable-Client-Key": STACK_PUB_CLIENT_KEY,
-         "X-Stack-Access-Type": "client"}
-    if headers:
-        h.update(headers)
-    req = urllib.request.Request("https://api.stack-auth.com/api/v1" + path,
+def _neon_auth(path, payload=None, session=None):
+    """Call Neon Auth (Better Auth). Returns (json body, session cookie value or None).
+
+    Better Auth refuses requests without an Origin, and only accepts origins on
+    the project's trusted-domains list — so PUBLIC_URL must be added there.
+    """
+    if not NEON_AUTH_URL:
+        raise RuntimeError("NEON_AUTH_URL is not set — see .env.example.")
+    h = {"Content-Type": "application/json", "Origin": ISSUER}
+    if session:
+        h["Cookie"] = f"{SESSION_COOKIE}={session}"
+    req = urllib.request.Request(NEON_AUTH_URL + path,
                                  json.dumps(payload).encode() if payload is not None else None, h)
     with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())
+        body = json.loads(r.read())
+        cookies = r.headers.get_all("Set-Cookie") or []
+    new_session = next((c.split(";", 1)[0].split("=", 1)[1] for c in cookies
+                        if c.startswith(SESSION_COOKIE + "=")), None)
+    return body, new_session
+
+
+def _tokens_for(session):
+    """Trade a Better Auth session for OAuth tokens: a fresh JWT + the session as refresh."""
+    body, _ = _neon_auth("/token", session=session)
+    return {"access_token": body["token"], "refresh_token": session}
 
 
 LOGIN_FORM = """<!doctype html><html><head><meta charset="utf-8">
@@ -140,23 +159,26 @@ def register_oauth_routes(mcp):
                 f'{params["redirect_uri"]}{sep}code={code}&state={urllib.parse.quote(params["state"], safe="")}',
                 status_code=302)
         email, password = form.get("email", ""), form.get("password", "")
-        path = "/auth/password/sign-up" if form.get("mode") == "signup" else "/auth/password/sign-in"
+        path = "/sign-up/email" if form.get("mode") == "signup" else "/sign-in/email"
         payload = {"email": email, "password": password}
         if form.get("mode") == "signup":
-            payload["verification_callback_url"] = ISSUER
+            payload["name"] = email.split("@")[0]       # Better Auth requires a name
         try:
-            tokens = _stack(path, payload)
+            _, session = _neon_auth(path, payload)
+            tokens = _tokens_for(session)
         except urllib.error.HTTPError as e:
-            # Parse Stack's error code so the human gets the TRUTH, not a shrug
+            # Parse the provider's error code so the human gets the TRUTH, not a shrug
             # (known-problems #1: the generic copy turned a created-account
             # retry into what read as rejection, live in class 2026-10-08).
             try:
-                stack_code = json.loads(e.read()).get("code", "")
+                auth_code = json.loads(e.read()).get("code", "")
             except Exception:
-                stack_code = ""
-            if stack_code == "USER_EMAIL_ALREADY_EXISTS" or (path.endswith("sign-up") and e.code == 409):
+                auth_code = ""
+            if "ALREADY_EXISTS" in auth_code:
                 msg = "Good news: this email already has an account — press SIGN IN instead."
-            elif path.endswith("sign-in"):
+            elif auth_code == "MISSING_ORIGIN" or "ORIGIN" in auth_code:
+                msg = "The server's URL isn't on Neon Auth's trusted domains yet — ask its owner to add it."
+            elif path.endswith("/sign-in/email"):
                 msg = "Sign-in failed — wrong password, or no account yet (then use sign up)."
             else:
                 msg = "Sign-up failed — password may be too weak (8+ characters), or try sign in."
@@ -189,18 +211,17 @@ def register_oauth_routes(mcp):
                                      "error_description": "PKCE verification failed"}, status_code=400)
             t = rec["tokens"]
             return JSONResponse({"access_token": t["access_token"],
-                                 "token_type": "bearer", "expires_in": 3600,
+                                 "token_type": "bearer", "expires_in": 900,   # Neon Auth JWTs last 15 min
                                  "refresh_token": t.get("refresh_token", "")})
         if grant == "refresh_token":
             if form.get("refresh_token", "") == GUEST_TOKEN:
                 return JSONResponse({"access_token": GUEST_TOKEN, "token_type": "bearer",
                                      "expires_in": 31536000, "refresh_token": GUEST_TOKEN})
             try:
-                t = _stack("/auth/sessions/current/refresh", payload={},
-                           headers={"X-Stack-Refresh-Token": form.get("refresh_token", "")})
+                t = _tokens_for(form.get("refresh_token", ""))
                 return JSONResponse({"access_token": t["access_token"],
-                                     "token_type": "bearer", "expires_in": 3600,
-                                     "refresh_token": form.get("refresh_token", "")})
+                                     "token_type": "bearer", "expires_in": 900,
+                                     "refresh_token": t["refresh_token"]})
             except Exception:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)

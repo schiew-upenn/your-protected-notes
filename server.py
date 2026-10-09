@@ -15,13 +15,18 @@ exists to demonstrate.
 """
 import os
 import secrets
+import urllib.parse
 
 import psycopg
 from mcp.server.fastmcp import Context, FastMCP
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-JWKS_URL = os.environ.get("NEON_AUTH_JWKS_URL")   # from `provision_neon_auth` / Neon console
-STACK_PROJECT_ID = os.environ.get("STACK_PROJECT_ID", "")
+NEON_AUTH_URL = os.environ.get("NEON_AUTH_URL", "").rstrip("/")   # Neon console -> Settings -> Better Auth
+JWKS_URL = os.environ.get("NEON_AUTH_JWKS_URL") or (
+    f"{NEON_AUTH_URL}/.well-known/jwks.json" if NEON_AUTH_URL else None)
+# Neon Auth (Better Auth) issues JWTs whose audience is the auth host's origin (ADR-0003).
+_auth = urllib.parse.urlsplit(NEON_AUTH_URL)
+AUDIENCE = f"{_auth.scheme}://{_auth.netloc}" if NEON_AUTH_URL else ""
 
 # Crockford Base32 (no I, L, O, U — unambiguous aloud, unlucky words excluded).
 # 4 chars = 32^4 = 1,048,576 petnames: plenty for a shelf of notes.
@@ -80,20 +85,16 @@ def current_identity(ctx: Context):
     import jwt as pyjwt
     from jwt import PyJWKClient
     if not JWKS_URL:
-        raise RuntimeError("NEON_AUTH_JWKS_URL is not set — see README step 1.")
+        raise RuntimeError("NEON_AUTH_URL is not set — see .env.example.")
     signing_key = PyJWKClient(JWKS_URL).get_signing_key_from_jwt(token)
     claims = pyjwt.decode(
-        token, signing_key.key, algorithms=["ES256", "RS256"],
-        audience=STACK_PROJECT_ID or None,
-        options={"verify_aud": bool(STACK_PROJECT_ID)},
+        token, signing_key.key, algorithms=["EdDSA", "ES256", "RS256"],   # Better Auth signs EdDSA
+        audience=AUDIENCE or None,
+        options={"verify_aud": bool(AUDIENCE)},
     )
     user_id = claims["sub"]                      # the identity (ADR-0001 D1)
-    email = None
-    with db() as conn, conn.cursor() as cur:     # display only, never the key
-        cur.execute("SELECT email FROM neon_auth.users_sync WHERE id = %s", (user_id,))
-        row = cur.fetchone()
-        email = row[0] if row else None
-    return user_id, email
+    email = claims.get("email")                  # display only, never the key; Better Auth puts
+    return user_id, email                        # it in the token (no users_sync table — ADR-0003)
 
 
 # ------------------------------------------------------------------- tools
